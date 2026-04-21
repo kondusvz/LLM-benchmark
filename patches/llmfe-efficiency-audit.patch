@@ -1,0 +1,258 @@
+diff --git a/llmfe/config.py b/llmfe/config.py
+index 0bd4216..63ceac7 100644
+--- a/llmfe/config.py
++++ b/llmfe/config.py
+@@ -44,6 +44,7 @@ class Config:
+     num_evaluators: int = 1
+     samples_per_prompt: int = 3
+     evaluate_timeout_seconds: int = 30
++    evaluate_max_memory_bytes: int | None = 2 * 1024 * 1024 * 1024
+     use_api: bool = False
+     api_model: str = "gpt-3.5-turbo"
+ 
+@@ -51,4 +52,4 @@ class Config:
+ @dataclasses.dataclass()
+ class ClassConfig:
+     llm_class: Type[sampler.LLM]
+-    sandbox_class: Type[evaluator.Sandbox]
+\ No newline at end of file
++    sandbox_class: Type[evaluator.Sandbox]
+diff --git a/llmfe/evaluator.py b/llmfe/evaluator.py
+index e1d8c13..e77185b 100644
+--- a/llmfe/evaluator.py
++++ b/llmfe/evaluator.py
+@@ -3,6 +3,11 @@ from __future__ import annotations
+ 
+ from abc import abstractmethod, ABC
+ import ast
++import ctypes
++import multiprocessing as mp
++import numbers
++import os
++import queue
+ import time
+ from collections.abc import Sequence
+ import copy
+@@ -15,6 +20,89 @@ from llmfe import buffer
+ from llmfe import evaluator_accelerate
+ 
+ 
++if os.name == 'nt':
++    class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
++        _fields_ = [
++            ('cb', ctypes.c_ulong),
++            ('PageFaultCount', ctypes.c_ulong),
++            ('PeakWorkingSetSize', ctypes.c_size_t),
++            ('WorkingSetSize', ctypes.c_size_t),
++            ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
++            ('QuotaPagedPoolUsage', ctypes.c_size_t),
++            ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
++            ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
++            ('PagefileUsage', ctypes.c_size_t),
++            ('PeakPagefileUsage', ctypes.c_size_t),
++            ('PrivateUsage', ctypes.c_size_t),
++        ]
++
++
++def _get_process_memory_bytes(pid: int | None) -> int | None:
++    """Best-effort process memory lookup for cap enforcement."""
++    if pid is None:
++        return None
++
++    if os.name != 'nt':
++        return None
++
++    kernel32 = ctypes.windll.kernel32
++    psapi = ctypes.windll.psapi
++    process_query_limited_information = 0x1000
++    process_vm_read = 0x0010
++    handle = kernel32.OpenProcess(
++        process_query_limited_information | process_vm_read,
++        False,
++        pid,
++    )
++    if not handle:
++        return None
++
++    try:
++        counters = PROCESS_MEMORY_COUNTERS_EX()
++        counters.cb = ctypes.sizeof(counters)
++        ok = psapi.GetProcessMemoryInfo(
++            handle,
++            ctypes.byref(counters),
++            counters.cb,
++        )
++        if not ok:
++            return None
++        return int(counters.PrivateUsage or counters.WorkingSetSize)
++    finally:
++        kernel32.CloseHandle(handle)
++
++
++def _execute_program_worker(
++        program: str,
++        function_to_run_name: str,
++        function_to_evolve: str,
++        dataset: Any,
++        numba_accelerate: bool,
++        result_queue: Any,
++) -> None:
++    """Run untrusted generated code in an isolated child process."""
++    try:
++        if numba_accelerate:
++            program = evaluator_accelerate.add_numba_decorator(
++                program=program,
++                function_to_evolve=function_to_evolve
++            )
++
++        all_globals_namespace = {}
++        exec(program, all_globals_namespace)
++        function_to_run = all_globals_namespace[function_to_run_name]
++        results = function_to_run(dataset)
++
++        score = results[0] if isinstance(results, (tuple, list)) and results else None
++        if not isinstance(score, numbers.Real):
++            result_queue.put((None, False))
++        else:
++            result_queue.put((float(score), True))
++    except Exception as e:
++        print(f"Execution Error: {e}")
++        result_queue.put((None, False))
++
++
+ class _FunctionLineVisitor(ast.NodeVisitor):
+     """ Visitor that finds the last line number of a function with a given name."""
+ 
+@@ -114,7 +202,7 @@ class LocalSandbox(Sandbox):
+     Returns a 'score' for the executed program.
+     """
+ 
+-    def __init__(self, verbose=False, numba_accelerate=False):
++    def __init__(self, verbose=False, numba_accelerate=False, memory_limit_bytes: int | None = None):
+         """
+         Initialize Sandbox.
+         
+@@ -124,6 +212,7 @@ class LocalSandbox(Sandbox):
+         """
+         self._verbose = verbose
+         self._numba_accelerate = numba_accelerate
++        self._memory_limit_bytes = memory_limit_bytes
+ 
+ 
+     def run(self, program: str, function_to_run: str, function_to_evolve: str,
+@@ -135,14 +224,58 @@ class LocalSandbox(Sandbox):
+         """
+ 
+         dataset = inputs[test_input]
+-        result_container = []
+-        results = self._compile_and_run_function(
+-                            program, function_to_run, function_to_evolve, dataset, self._numba_accelerate,
+-                            result_container
+-                        )
++        ctx = mp.get_context('spawn')
++        result_queue = ctx.Queue(maxsize=1)
++        process = ctx.Process(
++            target=_execute_program_worker,
++            args=(
++                program,
++                function_to_run,
++                function_to_evolve,
++                dataset,
++                self._numba_accelerate,
++                result_queue,
++            ),
++        )
++
++        timeout_hit = False
++        memory_hit = False
++        reset_time = time.time()
++        process.start()
++
++        while process.is_alive():
++            if timeout_seconds and time.time() - reset_time > timeout_seconds:
++                timeout_hit = True
++                process.terminate()
++                break
++
++            if self._memory_limit_bytes is not None:
++                memory_usage = _get_process_memory_bytes(process.pid)
++                if memory_usage is not None and memory_usage > self._memory_limit_bytes:
++                    memory_hit = True
++                    process.terminate()
++                    break
++
++            time.sleep(0.1)
++
++        process.join(timeout=1.0)
++        if process.is_alive():
++            process.kill()
++            process.join(timeout=1.0)
++
++        if timeout_hit or memory_hit:
++            if self._verbose:
++                reason = 'timeout' if timeout_hit else 'memory limit'
++                print(f'Execution aborted due to {reason}.')
++            result_queue.close()
++            return None, False
++
++        score, runs_ok = self._get_results(result_queue)
++        result_queue.close()
++        if runs_ok:
++            results = ((score, dataset['inputs'], dataset['outputs']), True)
++        else:
++            results = (None, False)
+ 
+-        # # Wait for the computation to finish or timeout
+-        # computation_thread.join(timeout=timeout_seconds)
+         if self._verbose:
+             self._print_evaluation_details(program, results, **kwargs)
+@@ -151,8 +284,10 @@ class LocalSandbox(Sandbox):
+ 
+     def _get_results(self, queue):
+         for _ in range(5):
+-            if not queue.empty():
+-                return queue.get_nowait()
++            try:
++                return queue.get(timeout=0.2)
++            except queue.Empty:
++                pass
+             time.sleep(0.1)
+         return None, False
+ 
+@@ -216,6 +351,7 @@ class Evaluator:
+             function_to_run: str, 
+             inputs: Sequence[Any],
+             timeout_seconds: int = 30,
++            memory_limit_bytes: int | None = None,
+             sandbox_class: Type[Sandbox] = Sandbox
+     ):
+         self._database = database
+@@ -224,7 +360,7 @@ class Evaluator:
+         self._function_to_run = function_to_run
+         self._inputs = inputs
+         self._timeout_seconds = timeout_seconds
+-        self._sandbox = sandbox_class()
++        self._sandbox = sandbox_class(memory_limit_bytes=memory_limit_bytes)
+ 
+     def analyse(
+             self,
+diff --git a/llmfe/pipeline.py b/llmfe/pipeline.py
+index faece6e..ff44653 100644
+--- a/llmfe/pipeline.py
++++ b/llmfe/pipeline.py
+@@ -69,6 +69,7 @@ def main(
+             function_to_run,
+             inputs,
+             timeout_seconds=config.evaluate_timeout_seconds,
++            memory_limit_bytes=config.evaluate_max_memory_bytes,
+             sandbox_class=class_config.sandbox_class
+         ))
+ 
+@@ -87,4 +88,4 @@ def main(
+     # sampler enters an infinite loop, without parallelization only the first
+     # sampler will do any work.
+     for s in samplers:
+-        s.sample(profiler=profiler)
+\ No newline at end of file
++        s.sample(profiler=profiler)
+

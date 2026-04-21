@@ -1,0 +1,53 @@
+diff --git a/templates/ask_llm.txt b/templates/ask_llm.txt
+index ad341a0..1e536a1 100644
+--- a/templates/ask_llm.txt
++++ b/templates/ask_llm.txt
+@@ -27,4 +27,7 @@ For the numerical variable only,
+ 
+ 
+ Answer: 
+-Step 1. The relationship between each feature and the task description:
+\ No newline at end of file
++Step 1. The relationship between each feature and the task description:
++
++IMPORTANT: you MUST complete both step 1 and step 2 in a single response. Do not stop after step 1. Do not ask for permission to continue. Provide
++all 10 coniditions per answer class immediately after step 1.
+\ No newline at end of file
+diff --git a/utils.py b/utils.py
+index 91fb095..dba15bf 100644
+--- a/utils.py
++++ b/utils.py
+@@ -24,11 +24,32 @@ TASK_DICT = {
+ }
+ 
+ 
+-def evaluate(pred_probs, answers, multiclass=False):
++def evaluate(pred_probs, answers, multiclass=False, labels=None):
+     if multiclass == False:
+         result_auc = roc_auc_score(answers, pred_probs[:, 1])
+     else:
+-        result_auc = roc_auc_score(answers, pred_probs, multi_class='ovr', average='macro')
++        if labels is None:
++            labels = sorted(np.unique(answers).tolist())
++
++        labels = np.array(labels)
++        answers = np.asarray(answers)
++        pred_probs = np.asarray(pred_probs)
++
++        auc_scores = []
++        for class_idx, label in enumerate(labels):
++            y_true_binary = (answers == label).astype(int)
++
++            # Skip degenerate one-vs-rest cases where the class is entirely
++            # absent or present in all rows of the evaluation split.
++            if y_true_binary.min() == y_true_binary.max():
++                continue
++
++            auc_scores.append(roc_auc_score(y_true_binary, pred_probs[:, class_idx]))
++
++        if not auc_scores:
++            raise ValueError("No evaluable classes for multiclass ROC AUC.")
++
++        result_auc = float(np.mean(auc_scores))
+     return result_auc
+
