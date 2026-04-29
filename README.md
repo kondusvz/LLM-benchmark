@@ -207,25 +207,7 @@ full `pip freeze` snapshots are included under `env_specs/`:
 - [`env_specs/venv_openfe_pip_freeze.txt`](env_specs/venv_openfe_pip_freeze.txt)
 - [`env_specs/venv_ownm_pip_freeze.txt`](env_specs/venv_ownm_pip_freeze.txt)
 
-## Included vs Excluded Material
 
-Included in the GitHub-facing supplement:
-
-- benchmark runner code
-- shared utilities and evaluator
-- datasets
-- environment snapshot files under `env_specs/`
-- result summaries and final analysis outputs
-- patch notes and patch snapshots
-
-Excluded from version control:
-
-- `venvs/`
-- `features/`
-- `old_features/`
-- caches, logs, temporary outputs, and machine-specific files
-- upstream clone working noise such as `repos/*/logs`, `repos/*/rules`, and
-  `repos/*/data`
 
 ## Notes on Patch Fidelity
 
@@ -233,12 +215,7 @@ This repository is not a strict paper-faithful reproduction of every compared
 method. The emphasis was on running all methods inside a unified benchmark with
 shared datasets, shared evaluation, and comparable outputs.
 
-Recommended description for the dissertation:
 
-> Results should be interpreted as benchmark-integrated implementations rather
-> than exact reproductions of the original papers. Several local patches were
-> required for compatibility, multiclass robustness, token attribution, and
-> unified evaluation.
 
 ## Additional Documentation
 
